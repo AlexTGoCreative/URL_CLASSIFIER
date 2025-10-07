@@ -1,6 +1,7 @@
 """
-EBBU Hybrid Model - URL Phishing Detection Inference Script
-Load saved hybrid model and predict on hardcoded URLs
+Enhanced URL Phishing Detection Inference Script
+Uses 17 handcrafted features + BERT embeddings
+Compatible with improved main_ebbu_hybrid.py model
 """
 
 import pickle
@@ -9,68 +10,98 @@ from pathlib import Path
 from collections import Counter
 from urllib.parse import urlparse
 import pandas as pd
+import torch
+from transformers import AutoTokenizer, AutoModel
 import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# HANDCRAFTED FEATURE EXTRACTOR (same as in main_ebbu_hybrid.py)
+# HANDCRAFTED FEATURE EXTRACTOR (17 Features - matches main_ebbu_hybrid.py)
 # ============================================================================
 
 class HandcraftedFeatureExtractor:
     """
     Extract 17 handcrafted features to complement BERT embeddings
-    Based on Sahingoz et al. 2019 URL analysis research
-    
-    Features extracted:
-    1. Domain Randomness - Is domain created with random characters?
-    2. Is Random Domain - Binary flag for randomness > 0.7
-    3. Alexa Top 1M - Is domain in Alexa Top 1M list?
-    4. Alexa Top 100K - Is domain in Alexa Top 100K list?
-    5. Subdomain Count - Number of subdomains in URL
-    6. Domain Length - Length of domain
-    7. Path Length - Length of URL path
-    8. Path Depth - Number of directory levels (/ count)
-    9. URL Length - Total URL length
-    10. Digit Count - Number of digits in URL
-    11. Special Char Count - Count of special chars {'-', '.', '/', '@', '?', '&', '=', '_'}
-    12. Has IP - Does domain contain IP address?
-    13. HTTPS - Is URL using HTTPS?
-    14. Has www - Does domain start with 'www'?
-    15. Punycode - Does URL use punycode encoding?
-    16. Consecutive Chars - Max consecutive character repetition
-    17. Known TLD - Is TLD in known list (com, org, net, edu, gov)?
+    Matches exactly the feature extraction in main_ebbu_hybrid.py
     """
     
     def __init__(self, alexa_path='data/url_datasets/EBBU/top-1m.csv'):
         self.alexa_domains = None
         self.alexa_path = alexa_path
-        self.known_tlds = {'com', 'org', 'net', 'edu', 'gov', 'de', 'uk', 'ca', 'au', 'fr', 'it', 'es', 'ru', 'cn', 'jp', 'br', 'in', 'mx', 'nl', 'se'}
+        self.known_tlds = {
+            'com', 'org', 'net', 'edu', 'gov', 'mil', 'int',
+            'de', 'uk', 'cn', 'nl', 'eu', 'ru', 'br', 'au',
+            'fr', 'it', 'ca', 'es', 'pl', 'jp', 'in', 'ch'
+        }
     
     def extract_features(self, url):
-        """Extract handcrafted features from URL"""
+        """Extract 17 handcrafted features from URL"""
         features = {}
         
         try:
             parsed = urlparse(url)
             domain = parsed.netloc
+            path = parsed.path
+            query = parsed.query
             
             # Get registered domain (remove subdomains)
             registered_domain = self._get_registered_domain(domain)
             
-            # ========== DOMAIN RANDOMNESS ==========
+            # 1-2. Domain Randomness features
             features['domain_randomness'] = self._calculate_domain_randomness(registered_domain)
-            features['is_random_domain'] = int(features['domain_randomness'] > 0.7)  # threshold
+            features['is_random_domain'] = int(features['domain_randomness'] > 0.7)
             
-            # ========== EXTERNAL METADATA ==========
-            # Alexa ranking
+            # 3-4. Alexa reputation features
             features['alexa_top_1m'] = int(self._is_alexa_domain(domain))
             features['alexa_top_100k'] = int(self._is_alexa_domain(domain, top_n=100000))
+            
+            # 5-6. Subdomain features
+            features['subdomain_count'] = domain.count('.') - 1 if '.' in domain else 0
+            features['domain_length'] = len(domain)
+            
+            # 7-8. Path features
+            features['path_length'] = len(path)
+            features['path_depth'] = path.count('/')
+            
+            # 9-10. URL character features
+            features['url_length'] = len(url)
+            features['digit_count'] = sum(c.isdigit() for c in url)
+            
+            # 11. Special characters
+            special_chars = {'-', '.', '/', '@', '?', '&', '=', '_'}
+            features['special_char_count'] = sum(c in special_chars for c in url)
+            
+            # 12. IP address in domain
+            features['has_ip'] = int(self._has_ip_address(domain))
+            
+            # 13. HTTPS protocol
+            features['https'] = int(parsed.scheme == 'https')
+            
+            # 14. WWW prefix
+            features['has_www'] = int(domain.startswith('www.'))
+            
+            # 15. Punycode encoding
+            features['has_punycode'] = int('xn--' in domain.lower())
+            
+            # 16. Consecutive character repetition
+            features['max_consecutive_chars'] = self._max_consecutive_chars(url)
+            
+            # 17. Known TLD
+            tld = domain.split('.')[-1] if '.' in domain else ''
+            features['known_tld'] = int(tld.lower() in self.known_tlds)
             
         except Exception as e:
             # Return default features on error
             features = {
                 'domain_randomness': 0.0, 'is_random_domain': 0,
-                'alexa_top_1m': 0, 'alexa_top_100k': 0
+                'alexa_top_1m': 0, 'alexa_top_100k': 0,
+                'subdomain_count': 0, 'domain_length': 0,
+                'path_length': 0, 'path_depth': 0,
+                'url_length': 0, 'digit_count': 0,
+                'special_char_count': 0, 'has_ip': 0,
+                'https': 0, 'has_www': 0,
+                'has_punycode': 0, 'max_consecutive_chars': 0,
+                'known_tld': 0
             }
         
         return features
@@ -95,6 +126,41 @@ class HandcraftedFeatureExtractor:
         entropy = -sum((count/length) * np.log2(count/length) for count in counter.values())
         return entropy
     
+    def _calculate_domain_randomness(self, domain):
+        """Calculate randomness score for domain"""
+        if not domain:
+            return 0.0
+        domain_name = domain.split('.')[0] if '.' in domain else domain
+        entropy = self._calculate_entropy(domain_name)
+        max_entropy = np.log2(min(26, len(domain_name))) if len(domain_name) > 0 else 1
+        normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
+        has_numbers = any(c.isdigit() for c in domain_name)
+        length_factor = min(1.0, len(domain_name) / 20)
+        randomness_score = (normalized_entropy * 0.7 + 
+                          (0.1 if has_numbers else 0) +
+                          length_factor * 0.2)
+        return min(1.0, randomness_score)
+    
+    def _has_ip_address(self, domain):
+        """Check if domain contains IP address"""
+        import re
+        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+        return bool(re.search(ip_pattern, domain))
+    
+    def _max_consecutive_chars(self, text):
+        """Calculate maximum consecutive character repetition"""
+        if not text or len(text) < 2:
+            return 0
+        max_count = 1
+        current_count = 1
+        for i in range(1, len(text)):
+            if text[i] == text[i-1]:
+                current_count += 1
+                max_count = max(max_count, current_count)
+            else:
+                current_count = 1
+        return max_count
+    
     def _load_alexa_domains(self):
         """Load Alexa Top 1M domains"""
         if self.alexa_domains is not None:
@@ -107,49 +173,16 @@ class HandcraftedFeatureExtractor:
             print(f"⚠ Warning: Could not load Alexa domains: {e}")
             self.alexa_domains = set()
     
-    def _calculate_domain_randomness(self, domain):
-        """Calculate randomness score for domain"""
-        if not domain:
-            return 0.0
-        
-        # Remove TLD for analysis
-        domain_name = domain.split('.')[0] if '.' in domain else domain
-        
-        # Calculate entropy (higher = more random)
-        entropy = self._calculate_entropy(domain_name)
-        
-        # Normalize entropy (max entropy for domain length)
-        max_entropy = np.log2(min(26, len(domain_name))) if len(domain_name) > 0 else 1
-        normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
-        
-        # Additional randomness indicators
-        has_numbers = any(c.isdigit() for c in domain_name)
-        has_mixed_case = domain_name != domain_name.lower() and domain_name != domain_name.upper()
-        length_factor = min(1.0, len(domain_name) / 20)  # Very long domains are suspicious
-        
-        # Combine factors
-        randomness_score = (normalized_entropy * 0.7 + 
-                          (0.1 if has_numbers else 0) +
-                          (0.1 if has_mixed_case else 0) +
-                          length_factor * 0.1)
-        
-        return min(1.0, randomness_score)
-    
     def _is_alexa_domain(self, domain, top_n=1000000):
         """Check if domain is in Alexa Top N list"""
         if self.alexa_domains is None:
             self._load_alexa_domains()
-        
-        # Get registered domain
         registered_domain = self._get_registered_domain(domain)
         return registered_domain.lower() in self.alexa_domains
 
 # ============================================================================
-# BERT EMBEDDER (same as in main_ebbu_hybrid.py)
+# BERT EMBEDDER
 # ============================================================================
-
-import torch
-from transformers import AutoTokenizer, AutoModel
 
 class DomURLsBERTEmbedder:
     """Extract embeddings using DomURLs_BERT"""
@@ -198,21 +231,16 @@ class DomURLsBERTEmbedder:
 # PHISHING DETECTOR CLASS
 # ============================================================================
 
-class PhishingDetector:
+class EnhancedPhishingDetector:
     """
-    Phishing URL Detector using Hybrid Model (BERT + Random Forest)
+    Enhanced Phishing URL Detector
+    Uses 17 handcrafted features + BERT embeddings
     """
     
     def __init__(self, model_path, bert_model='amahdaouy/DomURLs_BERT'):
-        """
-        Initialize detector with saved model
-        
-        Args:
-            model_path: Path to saved model pickle file
-            bert_model: BERT model name/path for embeddings
-        """
+        """Initialize detector with saved model"""
         print("\n" + "="*70)
-        print("INITIALIZING PHISHING DETECTOR")
+        print("INITIALIZING ENHANCED PHISHING DETECTOR (17 Features + BERT)")
         print("="*70)
         
         # Load saved model
@@ -227,21 +255,26 @@ class PhishingDetector:
         self.scaler = model_package['scaler']
         self.feature_names = model_package['feature_names']
         
-        # Handle label_encoder (may not exist in Kaggle models)
+        # Handle label_encoder
         if 'label_encoder' in model_package:
             self.label_encoder = model_package['label_encoder']
         else:
-            # Create a simple label encoder for binary classification
-            print("⚠ No label_encoder found, creating default for phishing/legitimate")
+            print("⚠ No label_encoder found, creating default")
             from sklearn.preprocessing import LabelEncoder
             self.label_encoder = LabelEncoder()
-            self.label_encoder.classes_ = np.array(['legitimate', 'phishing'])
+            self.label_encoder.classes_ = np.array(['legit', 'phish'])
         
         self.model_type = model_package.get('model_type', 'Unknown')
         
         print(f"✓ Model type: {self.model_type}")
-        print(f"✓ Features: {len(self.feature_names)}")
+        print(f"✓ Total features: {len(self.feature_names)}")
         print(f"✓ Classes: {list(self.label_encoder.classes_)}")
+        
+        # Count handcrafted vs BERT features
+        handcrafted_count = len([f for f in self.feature_names if not f.startswith('bert')])
+        bert_count = len([f for f in self.feature_names if f.startswith('bert')])
+        print(f"✓ Handcrafted features: {handcrafted_count}")
+        print(f"✓ BERT features: {bert_count}")
         
         # Initialize feature extractors
         print("\n✓ Initializing feature extractors...")
@@ -253,33 +286,28 @@ class PhishingDetector:
         print("="*70 + "\n")
     
     def predict(self, url, verbose=True):
-        """
-        Predict if URL is phishing or legitimate
-        
-        Args:
-            url: URL string to classify
-            verbose: Print detailed analysis
-        
-        Returns:
-            dict with prediction results
-        """
+        """Predict if URL is phishing or legitimate"""
         if verbose:
             print(f"\n{'='*70}")
             print(f"ANALYZING URL: {url}")
             print(f"{'='*70}")
         
-        # Extract features
+        # Extract handcrafted features
         if verbose:
-            print("\n[1] Extracting handcrafted features...")
+            print("\n[1] Extracting 17 handcrafted features...")
         handcrafted = self.feature_extractor.extract_features(url)
         handcrafted_array = np.array([list(handcrafted.values())])
         
         if verbose:
-            print(f"    • Domain randomness: {handcrafted['domain_randomness']:.2f}")
-            print(f"    • Is random domain: {'Yes' if handcrafted['is_random_domain'] else 'No'}")
-            print(f"    • In Alexa Top 1M: {'Yes' if handcrafted['alexa_top_1m'] else 'No'}")
-            print(f"    • In Alexa Top 100K: {'Yes' if handcrafted['alexa_top_100k'] else 'No'}")
+            print(f"    • Domain randomness: {handcrafted['domain_randomness']:.3f}")
+            print(f"    • URL length: {handcrafted['url_length']}")
+            print(f"    • Subdomain count: {handcrafted['subdomain_count']}")
+            print(f"    • HTTPS: {'Yes' if handcrafted['https'] else 'No'}")
+            print(f"    • Alexa Top 1M: {'Yes' if handcrafted['alexa_top_1m'] else 'No'}")
+            print(f"    • Has IP: {'Yes' if handcrafted['has_ip'] else 'No'}")
+            print(f"    • Max consecutive chars: {handcrafted['max_consecutive_chars']}")
         
+        # Extract BERT embeddings
         if verbose:
             print("\n[2] Extracting BERT embeddings...")
         bert_embedding = self.embedder.get_embedding(url)
@@ -292,6 +320,7 @@ class PhishingDetector:
         if verbose:
             print("\n[3] Combining features...")
         X = np.hstack([handcrafted_array, bert_array])
+        print(f"    • Total features: {X.shape[1]}")
         
         # Scale and predict
         if verbose:
@@ -330,11 +359,9 @@ class PhishingDetector:
         
         # Prediction
         if result['is_phishing']:
-            verdict_symbol = "🚨 PHISHING"
-            verdict_color = "DANGER"
+            verdict_symbol = "🚨 PHISHING DETECTED"
         else:
-            verdict_symbol = "✅ LEGITIMATE"
-            verdict_color = "SAFE"
+            verdict_symbol = "✅ LEGITIMATE URL"
         
         print(f"\n{verdict_symbol}")
         print(f"Confidence: {result['confidence']*100:.2f}%")
@@ -346,12 +373,17 @@ class PhishingDetector:
             bar = "█" * bar_length + "░" * (50 - bar_length)
             print(f"  {label:>10s}: {bar} {prob*100:5.2f}%")
         
-        # Key features
+        # Key features analysis
         features = result['handcrafted_features']
-        print(f"\nKey Indicators:")
-        print(f"  • Domain Randomness: {features['domain_randomness']:.2f} {'⚠ HIGH' if features['is_random_domain'] else '✓ Normal'}")
-        print(f"  • Alexa Top 1M: {'✓ Yes' if features['alexa_top_1m'] else '✗ No'}")
-        print(f"  • Alexa Top 100K: {'✓ Yes' if features['alexa_top_100k'] else '✗ No'}")
+        print(f"\nKey Security Indicators:")
+        print(f"  • Domain Randomness: {features['domain_randomness']:.3f} {'⚠ HIGH' if features['is_random_domain'] else '✓ Normal'}")
+        print(f"  • URL Length: {features['url_length']} chars {'⚠ Long' if features['url_length'] > 75 else '✓ Normal'}")
+        print(f"  • HTTPS: {'✓ Secure' if features['https'] else '⚠ Not Secure'}")
+        print(f"  • Alexa Ranked: {'✓ Top 1M' if features['alexa_top_1m'] else '⚠ Unknown'}")
+        print(f"  • Has IP Address: {'⚠ Yes' if features['has_ip'] else '✓ No'}")
+        print(f"  • Known TLD: {'✓ Yes' if features['known_tld'] else '⚠ Unknown'}")
+        print(f"  • Punycode: {'⚠ Yes' if features['has_punycode'] else '✓ No'}")
+        print(f"  • Max Consecutive Chars: {features['max_consecutive_chars']} {'⚠ Suspicious' if features['max_consecutive_chars'] > 3 else '✓ Normal'}")
         
         print("="*70 + "\n")
     
@@ -364,47 +396,47 @@ class PhishingDetector:
         return results
 
 # ============================================================================
-# MAIN EXECUTION - HARDCODED TEST URLS
+# MAIN EXECUTION
 # ============================================================================
 
 def main():
-    """
-    Main inference script with hardcoded test URLs
-    """
+    """Main inference script with test URLs"""
     
-    # ========== CONFIGURATION ==========
-    # Path to saved model (update this to your actual model path)
-    MODEL_PATH = "mlruns/ckpts/ebbu_hybrid_<run_id>/phishing_detector_model.pkl"
-    
-    # If you want to use the latest model automatically:
+    # Find most recent model
     import os
     import glob
     
-    # Find most recent model
-    model_files = glob.glob("mlruns/ckpts/ebbu_hybrid_*/phishing_detector_model.pkl")
+    model_files = glob.glob("mlruns/ckpts/ebbu_hybrid_*/hybrid_model.pkl")
     if model_files:
         MODEL_PATH = max(model_files, key=os.path.getctime)
         print(f"Using most recent model: {MODEL_PATH}")
     else:
         print("⚠ No saved models found. Please run main_ebbu_hybrid.py first!")
-        print("Expected path: mlruns/ckpts/ebbu_hybrid_*/hybrid_model.pkl")
         return
     
-    # ========== HARDCODED TEST URLS ==========
+    # Test URLs
     test_urls = [
-        # Legitimate URLs
-        "https://paypal1.com",
+        # Legitimate
+        "https://www.google.com",
+        "https://www.github.com/pytorch/pytorch",
+        "https://stackoverflow.com/questions/tagged/python",
+        
+        # Suspicious
+        "http://paypal-verify-account.tk/login.php",
+        "http://192.168.1.1/admin/login.html",
+        "http://www.goooogle.com/signin",
+        "https://wwww.facebook.com.phishing.ru/login",
     ]
     
-    # ========== INITIALIZE DETECTOR ==========
-    detector = PhishingDetector(
+    # Initialize detector
+    detector = EnhancedPhishingDetector(
         model_path=MODEL_PATH,
         bert_model='amahdaouy/DomURLs_BERT'
     )
     
-    # ========== RUN PREDICTIONS ==========
+    # Run predictions
     print("\n" + "="*70)
-    print("RUNNING PREDICTIONS ON HARDCODED URLs")
+    print("RUNNING PREDICTIONS")
     print("="*70)
     
     results = []
@@ -413,9 +445,9 @@ def main():
         result = detector.predict(url, verbose=True)
         results.append(result)
     
-    # ========== SUMMARY ==========
+    # Summary
     print("\n" + "="*70)
-    print("SUMMARY OF ALL PREDICTIONS")
+    print("SUMMARY")
     print("="*70 + "\n")
     
     phishing_count = sum(1 for r in results if r['is_phishing'])
@@ -430,7 +462,7 @@ def main():
     for i, result in enumerate(results, 1):
         status = "🚨 PHISHING" if result['is_phishing'] else "✅ LEGIT"
         conf = result['confidence'] * 100
-        url_short = result['url'][:60] + "..." if len(result['url']) > 60 else result['url']
+        url_short = result['url'][:55] + "..." if len(result['url']) > 55 else result['url']
         print(f"{i:2d}. {status} ({conf:5.1f}%) | {url_short}")
     
     print("\n" + "="*70)

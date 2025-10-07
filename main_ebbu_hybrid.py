@@ -80,18 +80,46 @@ def load_ebbu_dataset(data_path='data/url_datasets/EBBU'):
     return train_df, dev_df, test_df, label_encoder
 
 # ============================================================================
-# SECTION 2: HANDCRAFTED FEATURE EXTRACTION
+# SECTION 2: HANDCRAFTED FEATURE EXTRACTION (17 Features)
 # ============================================================================
 
 class HandcraftedFeatureExtractor:
-    """Extract handcrafted features to complement BERT embeddings"""
+    """
+    Extract 17 handcrafted features to complement BERT embeddings
+    Based on Sahingoz et al. 2019 URL analysis research
+    
+    Features:
+    1. Domain Randomness - Statistical randomness of domain name
+    2. Is Random Domain - Binary flag for high randomness
+    3. Alexa Top 1M - Domain reputation check
+    4. Alexa Top 100K - Premium domain reputation
+    5. Subdomain Count - Number of subdomains
+    6. Domain Length - Length of domain name
+    7. Path Length - Length of URL path
+    8. Path Depth - Directory depth (/ count)
+    9. URL Length - Total URL length
+    10. Digit Count - Number of digits in URL
+    11. Special Char Count - Special characters count
+    12. Has IP - IP address in domain
+    13. HTTPS - Secure protocol usage
+    14. Has WWW - Starts with www
+    15. Punycode - International domain encoding
+    16. Consecutive Chars - Max character repetition
+    17. Known TLD - TLD in known list
+    """
     
     def __init__(self, alexa_path='data/url_datasets/EBBU/top-1m.csv'):
         self.alexa_domains = None
         self.alexa_path = alexa_path
+        # Top 20 most common TLDs worldwide
+        self.known_tlds = {
+            'com', 'org', 'net', 'edu', 'gov', 'mil', 'int',
+            'de', 'uk', 'cn', 'nl', 'eu', 'ru', 'br', 'au',
+            'fr', 'it', 'ca', 'es', 'pl', 'jp', 'in', 'ch'
+        }
     
     def extract_features(self, url):
-        """Extract handcrafted features from URL"""
+        """Extract 17 handcrafted features from URL"""
         features = {}
         
         try:
@@ -100,39 +128,64 @@ class HandcraftedFeatureExtractor:
             path = parsed.path
             query = parsed.query
             
-            # Domain features
+            # Get registered domain (remove subdomains)
             registered_domain = self._get_registered_domain(domain)
-            features['domain_length'] = len(domain)
+            
+            # 1-2. Domain Randomness features
             features['domain_randomness'] = self._calculate_domain_randomness(registered_domain)
             features['is_random_domain'] = int(features['domain_randomness'] > 0.7)
-            features['has_subdomain'] = int('.' in domain and domain.count('.') > 1)
-            features['subdomain_count'] = domain.count('.') - 1 if '.' in domain else 0
             
-            # Path features
-            features['path_length'] = len(path)
-            features['path_depth'] = path.count('/')
-            features['has_query'] = int(len(query) > 0)
-            features['query_length'] = len(query)
-            
-            # URL character features
-            features['url_length'] = len(url)
-            features['digit_count'] = sum(c.isdigit() for c in url)
-            features['special_char_count'] = sum(not c.isalnum() and c not in ['.', '/', ':', '-', '_'] for c in url)
-            features['has_ip'] = int(self._has_ip_address(domain))
-            features['https'] = int(parsed.scheme == 'https')
-            
-            # Alexa ranking features
+            # 3-4. Alexa reputation features
             features['alexa_top_1m'] = int(self._is_alexa_domain(domain))
             features['alexa_top_100k'] = int(self._is_alexa_domain(domain, top_n=100000))
+            
+            # 5-6. Subdomain features
+            features['subdomain_count'] = domain.count('.') - 1 if '.' in domain else 0
+            features['domain_length'] = len(domain)
+            
+            # 7-8. Path features
+            features['path_length'] = len(path)
+            features['path_depth'] = path.count('/')
+            
+            # 9-10. URL character features
+            features['url_length'] = len(url)
+            features['digit_count'] = sum(c.isdigit() for c in url)
+            
+            # 11. Special characters (Sahingoz et al. 2019: '-', '.', '/', '@', '?', '&', '=', '_')
+            special_chars = {'-', '.', '/', '@', '?', '&', '=', '_'}
+            features['special_char_count'] = sum(c in special_chars for c in url)
+            
+            # 12. IP address in domain
+            features['has_ip'] = int(self._has_ip_address(domain))
+            
+            # 13. HTTPS protocol
+            features['https'] = int(parsed.scheme == 'https')
+            
+            # 14. WWW prefix
+            features['has_www'] = int(domain.startswith('www.'))
+            
+            # 15. Punycode encoding (internationalized domains)
+            features['has_punycode'] = int('xn--' in domain.lower())
+            
+            # 16. Consecutive character repetition (phishing technique)
+            features['max_consecutive_chars'] = self._max_consecutive_chars(url)
+            
+            # 17. Known TLD
+            tld = domain.split('.')[-1] if '.' in domain else ''
+            features['known_tld'] = int(tld.lower() in self.known_tlds)
             
         except Exception as e:
             # Return default features on error
             features = {
-                'domain_length': 0, 'domain_randomness': 0.0, 'is_random_domain': 0,
-                'has_subdomain': 0, 'subdomain_count': 0, 'path_length': 0,
-                'path_depth': 0, 'has_query': 0, 'query_length': 0,
-                'url_length': 0, 'digit_count': 0, 'special_char_count': 0,
-                'has_ip': 0, 'https': 0, 'alexa_top_1m': 0, 'alexa_top_100k': 0
+                'domain_randomness': 0.0, 'is_random_domain': 0,
+                'alexa_top_1m': 0, 'alexa_top_100k': 0,
+                'subdomain_count': 0, 'domain_length': 0,
+                'path_length': 0, 'path_depth': 0,
+                'url_length': 0, 'digit_count': 0,
+                'special_char_count': 0, 'has_ip': 0,
+                'https': 0, 'has_www': 0,
+                'has_punycode': 0, 'max_consecutive_chars': 0,
+                'known_tld': 0
             }
         
         return features
@@ -177,6 +230,20 @@ class HandcraftedFeatureExtractor:
         import re
         ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
         return bool(re.search(ip_pattern, domain))
+    
+    def _max_consecutive_chars(self, text):
+        """Calculate maximum consecutive character repetition"""
+        if not text or len(text) < 2:
+            return 0
+        max_count = 1
+        current_count = 1
+        for i in range(1, len(text)):
+            if text[i] == text[i-1]:
+                current_count += 1
+                max_count = max(max_count, current_count)
+            else:
+                current_count = 1
+        return max_count
     
     def _load_alexa_domains(self):
         """Load Alexa Top 1M domains"""
