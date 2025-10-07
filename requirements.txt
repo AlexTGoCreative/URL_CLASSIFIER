@@ -1,0 +1,60 @@
+# Core ML/DL packages - Python 3.13.6 Compatible
+torch>=2.5.1
+torchvision>=0.20.1
+torchaudio>=2.5.1
+lightning>=2.4.0
+torchmetrics>=1.4.3
+
+# Transformers and NLP
+transformers>=4.46.0
+tokenizers>=0.20.0
+datasets>=3.1.0
+huggingface-hub>=0.26.0
+
+# Data processing and utilities  
+numpy>=1.26.4
+pandas>=2.2.3
+scikit-learn>=1.5.2
+scipy>=1.14.1
+
+# MLflow for experiment tracking
+mlflow>=2.18.0
+databricks-cli>=0.18.0
+
+# Web scraping and URL processing
+requests>=2.32.3
+beautifulsoup4>=4.12.3
+urllib3>=2.2.3
+tldextract>=5.1.2
+netaddr>=1.3.0
+
+# File handling and serialization
+pyyaml>=6.0.2
+h5py>=3.12.1
+
+# Progress bars and CLI
+tqdm>=4.66.5
+click>=8.1.7
+colorama>=0.4.6
+
+# Development and testing (optional)
+pytest>=8.3.3
+black>=24.10.0
+flake8>=7.1.1
+isort>=5.13.2
+
+# Jupyter notebook support (optional)
+jupyter>=1.1.1
+jupyterlab>=4.3.0
+ipython>=8.29.0
+ipykernel>=6.29.5
+ipywidgets>=8.1.5
+
+# Additional utilities
+pillow>=10.4.0
+matplotlib>=3.9.2
+seaborn>=0.13.2
+plotly>=5.24.1
+
+# PyTorch Lightning specific
+pytorch-lightning>=2.4.0
